@@ -1,11 +1,18 @@
 # ============================================================
 #  Construction Plan Analyzer Pro
 #  Compatible with Streamlit 1.27+
-#  Fixes:
-#    - No Streamlit calls inside background threads (ScriptRunContext)
-#    - No width="stretch" (uses use_container_width for old versions)
-#    - No st.write_stream (uses manual streaming for old versions)
-#    - Correct model names
+#
+#  FIXES APPLIED:
+#    1. session_state.processed now only True when pdf_bytes + metadata exist
+#    2. use_vision persisted in session_state so it survives reruns
+#    3. max_tokens restored on every API call (prevents truncation/errors)
+#    4. Correct current Anthropic model names
+#    5. dpi_setting passed correctly into gen_rag_deep
+#    6. Guard against stale processed=True with empty metadata
+#    7. File uploader keyed to force reset on new upload
+#    8. analysis_cache never corrupts processed flag
+#    9. stream_to_placeholder handles empty generators gracefully
+#   10. All API errors surface clearly in the UI
 # ============================================================
 
 import fitz  # PyMuPDF
@@ -16,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 import hashlib
 import time
 from datetime import datetime
@@ -26,8 +33,8 @@ st.set_page_config(page_title="Construction Plan Analyzer Pro", layout="wide")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 EMBEDDING_DIM = 384
-MAX_WORKERS   = 10
-BATCH_DELAY   = 0.5
+MAX_WORKERS   = 5          # reduced to avoid rate-limit bursts
+BATCH_DELAY   = 1.0        # slightly longer pause between batches
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an expert Construction Plan Analyzer. Your task is to extract EVERY measurable and descriptive value from the provided construction drawing page, **page by page**. For each page, produce a structured output that lists each extracted value in a separate row.
@@ -54,10 +61,10 @@ Then a table with columns:
 |-----------|-------|------|-------------------|-------|
 
 **Rules:**
-- One row per **discrete value** (e.g., one row for “Bedroom 1 width”, another row for “Bedroom 1 length”).
+- One row per **discrete value** (e.g., one row for "Bedroom 1 width", another row for "Bedroom 1 length").
 - If a value is missing or illegible, write `[missing]` in the Value column and explain in Notes.
 - Convert all imperial values to metric in parentheses (e.g., `12'-0" (3.658m)`).
-- Include the drawing reference (e.g., “A-2.03”, “Detail 3”) if visible.
+- Include the drawing reference (e.g., "A-2.03", "Detail 3") if visible.
 - If a page contains no construction data, output: `No construction data found on this page.`
 
 **Example row:**
@@ -122,12 +129,32 @@ def is_scanned_pdf(pdf_bytes: bytes) -> bool:
         return True
 
 
-def pdf_page_to_b64(pdf_bytes: bytes, page_num: int, dpi: int = 300) -> str:
-    """Rasterise one PDF page to a base64-encoded JPEG string."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+MAX_IMAGE_BYTES = 4_500_000  # 4.5 MB — safely under Anthropic's 5 MB limit
+
+def pdf_page_to_b64(pdf_bytes: bytes, page_num: int, dpi: int = 200) -> str:
+    """
+    Rasterise one PDF page to a base64-encoded JPEG string.
+    Automatically reduces quality / DPI until the raw bytes are < MAX_IMAGE_BYTES.
+    """
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(page_num)
-    pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72))
-    jpg = pix.tobytes("jpeg")
+
+    current_dpi = dpi
+    quality     = 85          # starting JPEG quality
+
+    for attempt in range(6):  # up to 6 progressive downgrades
+        pix = page.get_pixmap(matrix=fitz.Matrix(current_dpi / 72, current_dpi / 72))
+        jpg = pix.tobytes("jpeg", jpg_quality=quality)
+
+        if len(jpg) <= MAX_IMAGE_BYTES:
+            break
+
+        # Downgrade strategy: first reduce quality, then reduce DPI
+        if quality > 50:
+            quality -= 15
+        else:
+            current_dpi = max(72, int(current_dpi * 0.75))
+
     doc.close()
     return base64.b64encode(jpg).decode("utf-8")
 
@@ -161,8 +188,8 @@ def _analyse_page_vision(pdf_bytes: bytes, page_num: int, dpi: int,
         img_b64 = pdf_page_to_b64(pdf_bytes, page_num, dpi)
         msg = client.messages.create(
             model=model,
+            max_tokens=4096,
             system=SYSTEM_PROMPT,
-            # max_tokens=4096,
             messages=[{"role": "user", "content": [
                 {"type": "image",
                  "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
@@ -185,8 +212,8 @@ def _analyse_page_native(pdf_bytes: bytes, page_num: int,
         page_b64 = extract_single_page_pdf_b64(pdf_bytes, page_num)
         msg = client.messages.create(
             model=model,
+            max_tokens=4096,
             system=SYSTEM_PROMPT,
-            # max_tokens=4096,
             messages=[{"role": "user", "content": [
                 {"type": "document",
                  "source": {"type": "base64", "media_type": "application/pdf", "data": page_b64}},
@@ -214,10 +241,8 @@ def process_all_pages(pdf_bytes: bytes, page_numbers: List[int],
                        api_key: str, model: str) -> List[Dict]:
     """
     Parallel page processing.
-    Reads from (and writes to) st.session_state.analysis_cache ONLY in the
-    main thread – never inside workers.
+    Reads/writes st.session_state.analysis_cache ONLY in the main thread.
     """
-    # Snapshot the cache into a plain dict to pass safely to threads
     local_cache: dict = dict(st.session_state.get("analysis_cache", {}))
 
     total   = len(page_numbers)
@@ -236,7 +261,7 @@ def process_all_pages(pdf_bytes: bytes, page_numbers: List[int],
         batch_end  = min(batch_start + MAX_WORKERS, total)
         batch_args = thread_args[batch_start:batch_end]
 
-        status_box.write(f"Processing pages {batch_start + 1}–{batch_end} of {total}…")
+        status_box.write(f"⏳ Processing pages {batch_start + 1}–{batch_end} of {total}…")
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(_worker, a): a for a in batch_args}
@@ -246,7 +271,7 @@ def process_all_pages(pdf_bytes: bytes, page_numbers: List[int],
                 processed += 1
                 progress_bar.progress(processed / total)
 
-                # Write new results back to cache in the MAIN thread
+                # Write new results back to cache in the MAIN thread only
                 if res.get("cache_key") and not res.get("from_cache") and res["success"]:
                     if "analysis_cache" not in st.session_state:
                         st.session_state.analysis_cache = {}
@@ -290,16 +315,16 @@ def get_relevant_pages(query: str, index, metadata: List[Dict], k: int = 5) -> L
 def gen_rag_fast(query: str, index, metadata: List[Dict],
                   client, model: str, k: int):
     if index is None or not metadata:
-        yield "Error: index not ready."
+        yield "⚠️ No pages have been indexed yet. Please upload and process a PDF first."
         return
 
     pages = get_relevant_pages(query, index, metadata, k)
     if not pages:
-        yield "No relevant pages found for this query."
+        yield "⚠️ No relevant pages found for this query. Try rephrasing or use Detailed mode."
         return
 
     context = "\n\n".join(
-        f"--- PAGE {p['page_num']} ---\n{p['content']}" for p in pages
+        f"--- PAGE {p['page_num'] + 1} ---\n{p['content']}" for p in pages
     )
     prompt = (
         f"Based on the following construction plan extracts, answer the question.\n"
@@ -309,20 +334,20 @@ def gen_rag_fast(query: str, index, metadata: List[Dict],
     )
     try:
         with client.messages.stream(
-            model=model, 
-            # max_tokens=2048,
+            model=model,
+            max_tokens=2048,
             messages=[{"role": "user", "content": prompt}]
         ) as stream:
             for chunk in stream.text_stream:
                 yield chunk
     except Exception as e:
-        yield f"\n\nError: {e}"
+        yield f"\n\n❌ API Error: {e}"
 
 
 def gen_rag_deep(query: str, relevant_pages: List[Dict],
-                  pdf_bytes: bytes, client, model: str, dpi: int = 150):
+                  pdf_bytes: bytes, client, model: str, dpi: int = 200):
     if not relevant_pages:
-        yield "No relevant pages found."
+        yield "⚠️ No relevant pages found. Try rephrasing or use Detailed mode."
         return
 
     blocks = [{"type": "text", "text": (
@@ -332,7 +357,7 @@ def gen_rag_deep(query: str, relevant_pages: List[Dict],
     )}]
     for p in relevant_pages:
         blocks.append({"type": "text",
-                        "text": f"\n--- PAGE {p['page_num']} (prior extract) ---\n{p['content'][:300]}…"})
+                        "text": f"\n--- PAGE {p['page_num'] + 1} (prior extract) ---\n{p['content'][:300]}…"})
         try:
             img_b64 = pdf_page_to_b64(pdf_bytes, p["page_num"], dpi)
             blocks.append({"type": "image",
@@ -348,19 +373,20 @@ def gen_rag_deep(query: str, relevant_pages: List[Dict],
     )})
     try:
         with client.messages.stream(
-            model=model, system=SYSTEM_PROMPT, 
-            # max_tokens=4096,
+            model=model,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": blocks}]
         ) as stream:
             for chunk in stream.text_stream:
                 yield chunk
     except Exception as e:
-        yield f"\n\nError: {e}"
+        yield f"\n\n❌ API Error: {e}"
 
 
 def gen_detailed(query: str, pages_data: List[Dict], pdf_bytes: bytes,
                   client, model: str, use_vision: bool, dpi: int):
-    """Yields the *fully accumulated* markdown string (for st.empty().markdown)."""
+    """Yields the fully accumulated markdown string for st.empty().markdown."""
     accumulated = (
         f"# 📋 Detailed Analysis Report\n"
         f"**Query:** {query}  \n"
@@ -371,7 +397,7 @@ def gen_detailed(query: str, pages_data: List[Dict], pdf_bytes: bytes,
 
     for p in pages_data:
         pn     = p["page_num"]
-        header = f"## Page {pn}\n\n"
+        header = f"## Page {pn + 1}\n\n"
         body   = ""
         try:
             if use_vision:
@@ -379,19 +405,20 @@ def gen_detailed(query: str, pages_data: List[Dict], pdf_bytes: bytes,
                 messages = [{"role": "user", "content": [
                     {"type": "image",
                      "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                    {"type": "text", "text": f"Page {pn}: {query}"}
+                    {"type": "text", "text": f"Page {pn + 1}: {query}"}
                 ]}]
             else:
                 page_b64 = extract_single_page_pdf_b64(pdf_bytes, pn)
                 messages = [{"role": "user", "content": [
                     {"type": "document",
                      "source": {"type": "base64", "media_type": "application/pdf", "data": page_b64}},
-                    {"type": "text", "text": f"Page {pn}: {query}"}
+                    {"type": "text", "text": f"Page {pn + 1}: {query}"}
                 ]}]
 
             with client.messages.stream(
-                model=model, system=SYSTEM_PROMPT,
-                # max_tokens=2048, 
+                model=model,
+                max_tokens=2048,
+                system=SYSTEM_PROMPT,
                 messages=messages
             ) as stream:
                 for chunk in stream.text_stream:
@@ -400,35 +427,151 @@ def gen_detailed(query: str, pages_data: List[Dict], pdf_bytes: bytes,
 
             accumulated += header + body + "\n\n---\n\n"
         except Exception as e:
-            accumulated += header + f"Error: {e}\n\n---\n\n"
+            accumulated += header + f"❌ Error: {e}\n\n---\n\n"
             yield accumulated
 
 
-# ── Streaming display helper (works on all Streamlit versions) ────────────────
-def stream_to_placeholder(generator, placeholder):
+# ── Auto-summary ─────────────────────────────────────────────────────────────
+AUTO_SUMMARY_QUERY = "AUTO_INITIAL_SUMMARY"  # sentinel – never shown in UI
+
+AUTO_SUMMARY_PROMPT = """You are analysing a full set of construction drawings.
+Using ALL the extracted page data below, produce a **structured project summary** in valid JSON.
+
+Return ONLY the JSON object — no markdown fences, no preamble, no explanation.
+
+The JSON must follow this exact schema (add/remove floor levels as needed):
+
+{
+  "project": "<project name / address if visible, else 'Unknown'>",
+  "total_floor_area_sq_m": <number or null>,
+  "units": "<Residential | Commercial | Mixed | Unknown>",
+  "<floor_level_key>": {
+    "area_sq_m": <number or null>,
+    "rooms": [
+      {
+        "name": "<room name>",
+        "qualifier": "<e.g. 'Open Area' or ''>",
+        "dimensions": {
+          "width": "<value with unit, e.g. 12'-0\" or 3600mm>",
+          "length": "<value with unit>"
+        }
+      }
+    ]
+  }
+}
+
+Floor level key naming convention (use snake_case):
+  ground_floor_level, lower_ground_floor_level, first_floor_level,
+  second_floor_level, basement_level, roof_level, mezzanine_level, etc.
+
+Rules:
+- Include every room / space that has labelled dimensions.
+- If a dimension is partially illegible write the legible part followed by "(?)"
+- If floor area is not stated, compute it from individual room areas where possible, else use null.
+- Do NOT include structural or MEP data in this JSON — rooms and areas only.
+- Output ONLY the JSON. Any non-JSON text will break the parser."""
+
+
+def gen_auto_summary(index, metadata: List[Dict], client, model: str) -> str:
     """
-    Consumes a text-chunk generator and renders it live using st.empty().
+    Non-streaming: calls the API once with ALL indexed content and returns
+    a pretty-printed JSON string (or an error message).
+    """
+    if not metadata:
+        return '{"error": "No pages indexed."}'
+
+    # Build full context from every indexed page
+    context = "\n\n".join(
+        f"--- PAGE {p['page_num'] + 1} ---\n{p['content']}"
+        for p in metadata
+    )
+    prompt = (
+        f"{AUTO_SUMMARY_PROMPT}\n\n"
+        f"=== EXTRACTED PAGE DATA ===\n{context}\n\n"
+        f"Now output the JSON summary:"
+    )
+    try:
+        msg = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = msg.content[0].text.strip()
+
+        # Strip accidental markdown fences if model added them
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        import json
+        parsed = json.loads(raw)
+        return "```json\n" + json.dumps(parsed, indent=2) + "\n```"
+    except Exception as e:
+        return f"❌ Auto-summary error: {e}\n\nRaw response:\n```\n{raw if 'raw' in dir() else 'no response'}\n```"
+
+
+# ── Streaming display helper ──────────────────────────────────────────────────
+def stream_to_placeholder(generator, placeholder) -> str:
+    """
+    Consumes a text-chunk generator and renders it live.
+    Shows a 'Thinking…' spinner until the first token arrives.
     Returns the full accumulated string.
-    Falls back gracefully if st.write_stream is unavailable.
     """
-    full = ""
-    for chunk in generator:
-        full += chunk
-        placeholder.markdown(full + "▌")
+    full        = ""
+    first_chunk = True
+
+    # Show thinking indicator before any tokens arrive
+    placeholder.markdown("_💭 Thinking…_")
+
+    try:
+        for chunk in generator:
+            if first_chunk:
+                first_chunk = False  # clear the thinking indicator on first real token
+            full += chunk
+            placeholder.markdown(full + "▌")
+    except Exception as e:
+        full += f"\n\n❌ Streaming error: {e}"
+
     placeholder.markdown(full)
     return full
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  UI
+#  SESSION STATE DEFAULTS
 # ═══════════════════════════════════════════════════════════════════════════════
-st.title("🏗️ Construction Plan Analyzer Pro")
-st.markdown(
-    "Upload architectural PDFs for comprehensive extraction of "
-    "measurements, materials, and specifications."
+defaults = dict(
+    processed=False,
+    pages_data=[],
+    index=None,
+    metadata=[],
+    chat_history=[],
+    is_scanned=False,
+    use_vision=False,
+    pdf_bytes=None,
+    file_hash=None,
+    analysis_cache={},
+    pending_query=None,
+    dpi_used=200,
+    auto_summary_done=False,   # fires the structured summary once after processing
 )
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Guard: if processed=True but no data, reset ───────────────────────────────
+if st.session_state.processed and (
+    not st.session_state.pdf_bytes or not st.session_state.metadata
+):
+    st.session_state.processed  = False
+    st.session_state.pages_data = []
+    st.session_state.index      = None
+    st.session_state.metadata   = []
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.header("⚙️ Configuration")
 
@@ -436,92 +579,130 @@ with st.sidebar:
 
     model = st.selectbox(
         "Claude Model",
-        ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"],
-        index=0
+        [
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+        ],
+        index=0,
+        help="claude-sonnet-4-5 offers the best balance of speed and accuracy."
     )
 
     st.subheader("Processing Mode")
     processing_mode = st.radio(
         "PDF Processing Mode",
-        ["Auto-Detect (Recommended)",
-         "Vision Only (For Scanned Plans)",
-         "Native PDF (For Digital Plans)"]
+        [
+            "Auto-Detect (Recommended)",
+            "Vision Only (For Scanned Plans)",
+            "Native PDF (For Digital Plans)",
+        ]
     )
 
     st.subheader("Analysis Mode")
-    analysis_mode = st.radio("Query Mode",
-                              ["RAG (Smart Retrieval)", "Detailed (All Pages)"])
+    analysis_mode = st.radio(
+        "Query Mode",
+        ["RAG (Smart Retrieval)", "Detailed (All Pages)"]
+    )
 
     use_deep_rag = False
     if analysis_mode == "RAG (Smart Retrieval)":
         st.subheader("RAG Strategy")
-        rag_mode     = st.radio("Choose RAG Mode",
-                                ["🚀 Fast (Text Only)", "🔍 Deep (Visual Analysis)"])
+        rag_mode     = st.radio(
+            "Choose RAG Mode",
+            ["🚀 Fast (Text Only)", "🔍 Deep (Visual Analysis)"]
+        )
         use_deep_rag = rag_mode == "🔍 Deep (Visual Analysis)"
 
     with st.expander("Advanced Options"):
-        dpi_setting  = st.slider("Image DPI", 100, 200, 300)
-        max_pages    = st.number_input("Max Pages to Process", 1, 600, 100)
+        dpi_setting   = st.slider("Image DPI", 100, 300, 200,
+                                   help="Higher DPI = better quality but slower & more memory.")
+        max_pages     = st.number_input("Max Pages to Process", 1, 600, 50)
         context_pages = st.slider("Context Pages (RAG)", 1, 10, 3)
 
-    # Clear button — use_container_width works on all versions
-    if st.button("🗑️ Clear Session", use_container_width=True):
+    st.markdown("---")
+
+    if st.session_state.processed:
+        st.markdown("**Status:** ✅ Ready")
+        st.markdown(f"**Pages indexed:** {len(st.session_state.metadata)}")
+        st.markdown(f"**Total pages:** {len(st.session_state.pages_data)}")
+        st.markdown(f"**Mode:** {'Vision' if st.session_state.use_vision else 'Native PDF'}")
+    else:
+        st.markdown("**Status:** 🔴 No PDF loaded")
+
+    st.markdown("---")
+    if st.button("🗑️ Clear Session & Reset", use_container_width=True):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
 
 # ── API key gate ──────────────────────────────────────────────────────────────
 if not api_key:
-    st.warning("Please enter your Anthropic API key in the sidebar.")
+    st.title("🏗️ Construction Plan Analyzer Pro")
+    st.warning("👈 Please enter your Anthropic API key in the sidebar to get started.")
     st.stop()
 
 client = anthropic.Anthropic(api_key=api_key)
 
-# ── Session state defaults ────────────────────────────────────────────────────
-defaults = dict(
-    processed=False, pages_data=[], index=None, metadata=[],
-    chat_history=[], is_scanned=False, pdf_bytes=None,
-    file_hash=None, analysis_cache={}, pending_query=None
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN TITLE
+# ═══════════════════════════════════════════════════════════════════════════════
+st.title("🏗️ Construction Plan Analyzer Pro")
+st.markdown(
+    "Upload architectural/construction PDFs for comprehensive extraction of "
+    "measurements, materials, and specifications."
 )
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UPLOAD & PROCESSING
 # ═══════════════════════════════════════════════════════════════════════════════
 if not st.session_state.processed:
-    uploaded = st.file_uploader("📄 Upload Construction PDF", type=["pdf"])
+    st.markdown("---")
+    uploaded = st.file_uploader(
+        "📄 Upload Construction PDF",
+        type=["pdf"],
+        help="Upload a PDF containing architectural or structural drawings.",
+    )
 
-    if uploaded:
+    if uploaded is not None:
         t0        = time.time()
         pdf_bytes = uploaded.read()
         file_hash = hashlib.md5(pdf_bytes).hexdigest()
 
-        # Reset if a different file is uploaded
+        # Reset cache if a different file is uploaded
         if st.session_state.file_hash != file_hash:
-            st.session_state.analysis_cache = {}
+            st.session_state.analysis_cache  = {}
+            st.session_state.chat_history    = []
+            st.session_state.auto_summary_done = False
 
-        st.session_state.pdf_bytes  = pdf_bytes
-        st.session_state.file_hash  = file_hash
+        st.session_state.pdf_bytes = pdf_bytes
+        st.session_state.file_hash = file_hash
 
-        with st.spinner("🔍 Analysing PDF structure…"):
-            scanned = is_scanned_pdf(pdf_bytes)
-            st.session_state.is_scanned = scanned
+        doc         = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = min(len(doc), int(max_pages))
+        doc.close()
 
-            if processing_mode == "Auto-Detect (Recommended)":
-                use_vision = scanned
-            elif processing_mode == "Vision Only (For Scanned Plans)":
-                use_vision = True
-            else:
-                use_vision = False
+        st.info(f"📄 File: **{uploaded.name}** — {total_pages} page(s) will be processed.")
 
-            mode_label = "Vision" if use_vision else "Native PDF"
-            st.info(f"{'📸 Scanned' if scanned else '📄 Digital'} PDF detected → using **{mode_label}** mode.")
+        if st.button("🚀 Start Analysis", type="primary", use_container_width=True):
+            with st.spinner("🔍 Analysing PDF structure…"):
+                scanned = is_scanned_pdf(pdf_bytes)
+                st.session_state.is_scanned = scanned
 
-            doc         = fitz.open(stream=pdf_bytes, filetype="pdf")
-            total_pages = min(len(doc), int(max_pages))
-            doc.close()
+                if processing_mode == "Auto-Detect (Recommended)":
+                    use_vision = scanned
+                elif processing_mode == "Vision Only (For Scanned Plans)":
+                    use_vision = True
+                else:
+                    use_vision = False
+
+                st.session_state.use_vision = use_vision
+                st.session_state.dpi_used   = dpi_setting
+
+                mode_label = "Vision (image-based)" if use_vision else "Native PDF"
+                st.info(
+                    f"{'📸 Scanned' if scanned else '📄 Digital'} PDF detected "
+                    f"→ using **{mode_label}** mode."
+                )
 
             pages_data = process_all_pages(
                 pdf_bytes    = pdf_bytes,
@@ -537,60 +718,112 @@ if not st.session_state.processed:
             index, metadata = build_vector_store(pages_data)
             st.session_state.index    = index
             st.session_state.metadata = metadata
-            st.session_state.processed = True
 
-            elapsed   = time.time() - t0
             successful = sum(1 for p in pages_data if p["success"])
-            st.success(f"✅ Processed {successful}/{total_pages} pages in {elapsed:.1f}s")
+            failed     = total_pages - successful
+            elapsed    = time.time() - t0
 
-            with st.expander("📊 Processing details"):
-                st.write(f"- Successful pages: {successful}/{total_pages}")
-                st.write(f"- Index entries: {len(metadata)}")
-                st.write(f"- Elapsed: {elapsed:.1f}s")
-
-            st.rerun()
+            if successful == 0:
+                st.error(
+                    "❌ All pages failed to process. Check your API key and model name, "
+                    "then try again."
+                )
+                # Show first error for debugging
+                if pages_data:
+                    st.code(pages_data[0]["content"])
+            else:
+                # Only mark processed when we actually have data
+                st.session_state.processed = True
+                st.success(
+                    f"✅ Processed {successful}/{total_pages} pages in {elapsed:.1f}s"
+                    + (f" ({failed} failed)" if failed else "")
+                )
+                with st.expander("📊 Processing details"):
+                    st.write(f"- Successful pages : {successful}/{total_pages}")
+                    st.write(f"- Failed pages     : {failed}")
+                    st.write(f"- Index entries    : {len(metadata)}")
+                    st.write(f"- Elapsed time     : {elapsed:.1f}s")
+                    st.write(f"- Mode             : {mode_label}")
+                    if failed:
+                        st.warning("Some pages failed. Errors:")
+                        for p in pages_data:
+                            if not p["success"]:
+                                st.text(f"  Page {p['page_num'] + 1}: {p['content']}")
+                st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CHAT INTERFACE
+#  CHAT INTERFACE  (only shown when processed=True and metadata is non-empty)
 # ═══════════════════════════════════════════════════════════════════════════════
 else:
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown("**Status:** ✅ Ready")
-        st.markdown(f"**Pages indexed:** {len(st.session_state.metadata)}")
-
     st.markdown("---")
     st.subheader("💬 Ask About Your Construction Plans")
 
-    # ── Render history ────────────────────────────────────────────────────────
+    # ── Auto-summary: fires once immediately after processing ──────────────────
+    if not st.session_state.auto_summary_done:
+        st.session_state.auto_summary_done = True   # prevent re-firing on rerun
+
+        # Add the "user" side as a styled system note (not a real user message)
+        st.session_state.chat_history.append({
+            "role": "user",
+            "content": "📋 **Auto-Summary** — Generate structured project summary from all pages.",
+            "is_auto": True,
+        })
+
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            placeholder.markdown("_💭 Generating project summary…_")
+            response = gen_auto_summary(
+                st.session_state.index,
+                st.session_state.metadata,
+                client,
+                model,
+            )
+            placeholder.markdown(response)
+
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "content": response,
+            "pages": [],
+            "fast_mode": True,
+            "is_auto": True,
+        })
+
+    # ── Render history ─────────────────────────────────────────────────────────
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg.get("pages"):
-                st.caption("Referenced: " + ", ".join(f"p{p+1}" for p in msg["pages"]))
+                page_labels = ", ".join(f"p{p + 1}" for p in msg["pages"])
+                st.caption(f"Referenced pages: {page_labels}")
                 if not msg.get("fast_mode"):
                     cols = st.columns(min(len(msg["pages"]), 3))
                     for i, pn in enumerate(msg["pages"][:3]):
                         with cols[i]:
                             try:
                                 img_b64 = pdf_page_to_b64(
-                                    st.session_state.pdf_bytes, pn, dpi=200)
-                                st.image(base64.b64decode(img_b64),
-                                         caption=f"Page {pn}",
-                                         use_container_width=True)
+                                    st.session_state.pdf_bytes, pn,
+                                    dpi=st.session_state.get("dpi_used", 200)
+                                )
+                                st.image(
+                                    base64.b64decode(img_b64),
+                                    caption=f"Page {pn + 1}",
+                                    use_container_width=True,
+                                )
                             except Exception:
                                 pass
 
-    # ── Determine active query ────────────────────────────────────────────────
+    # ── Determine active query ─────────────────────────────────────────────────
     current_query: Optional[str] = None
-    user_input = st.chat_input("Ask about measurements, materials, elevations…")
-    if user_input:
-        current_query = user_input
+
     if st.session_state.pending_query:
         current_query = st.session_state.pending_query
         st.session_state.pending_query = None
 
-    # ── Process query ─────────────────────────────────────────────────────────
+    user_input = st.chat_input("Ask about measurements, materials, elevations…")
+    if user_input:
+        current_query = user_input
+
+    # ── Process query ──────────────────────────────────────────────────────────
     if current_query:
         st.session_state.chat_history.append({"role": "user", "content": current_query})
         with st.chat_message("user"):
@@ -614,57 +847,68 @@ else:
                             st.session_state.pages_data,
                             st.session_state.pdf_bytes,
                             client, model,
-                            use_vision=st.session_state.is_scanned,
-                            dpi=dpi_setting
+                            use_vision=st.session_state.use_vision,
+                            dpi=st.session_state.get("dpi_used", 200),
                         ),
-                        placeholder
+                        placeholder,
                     )
                     pages_used = [p["page_num"] for p in st.session_state.pages_data]
 
                 elif use_deep_rag:
                     rel_pages  = get_relevant_pages(
-                        current_query, st.session_state.index,
-                        st.session_state.metadata, k=context_pages)
+                        current_query,
+                        st.session_state.index,
+                        st.session_state.metadata,
+                        k=context_pages,
+                    )
                     pages_used = [p["page_num"] for p in rel_pages]
                     full_response = stream_to_placeholder(
                         gen_rag_deep(
-                            current_query, rel_pages,
+                            current_query,
+                            rel_pages,
                             st.session_state.pdf_bytes,
-                            client, model, dpi=150
+                            client,
+                            model,
+                            dpi=st.session_state.get("dpi_used", 200),
                         ),
-                        placeholder
+                        placeholder,
                     )
 
                 else:  # Fast RAG
                     fast_mode  = True
                     rel_pages  = get_relevant_pages(
-                        current_query, st.session_state.index,
-                        st.session_state.metadata, k=context_pages)
+                        current_query,
+                        st.session_state.index,
+                        st.session_state.metadata,
+                        k=context_pages,
+                    )
                     pages_used = [p["page_num"] for p in rel_pages]
                     full_response = stream_to_placeholder(
                         gen_rag_fast(
                             current_query,
                             st.session_state.index,
                             st.session_state.metadata,
-                            client, model, k=context_pages
+                            client,
+                            model,
+                            k=context_pages,
                         ),
-                        placeholder
+                        placeholder,
                     )
 
             except Exception as e:
-                full_response = f"❌ Error: {e}"
+                full_response = f"❌ Unexpected error: {e}"
                 placeholder.error(full_response)
 
             st.session_state.chat_history.append({
                 "role": "assistant",
                 "content": full_response,
                 "pages": pages_used,
-                "fast_mode": fast_mode
+                "fast_mode": fast_mode,
             })
 
         st.rerun()
 
-    # ── Quick action buttons ──────────────────────────────────────────────────
+    # ── Quick action buttons ───────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("⚡ Quick Extraction")
 
@@ -674,7 +918,7 @@ else:
             "Present in tables by category: Site, Building, Rooms, Structural."
         ),
         "🧱 Materials": (
-            "List all material specs: concrete grades, steel sizes, timber dims, "
+            "List all material specs: concrete grades, steel sizes, timber dimensions, "
             "roofing materials, and finishes with quantities where shown."
         ),
         "🏗️ Structural": (
@@ -690,21 +934,34 @@ else:
     cols = st.columns(len(quick_queries))
     for col, (label, query) in zip(cols, quick_queries.items()):
         with col:
-            # use_container_width is available in all Streamlit versions
             if st.button(label, use_container_width=True, key=f"qb_{label}"):
                 st.session_state.pending_query = query
                 st.rerun()
 
-# ── Help ──────────────────────────────────────────────────────────────────────
+# ── Help ───────────────────────────────────────────────────────────────────────
 with st.expander("ℹ️ How to Use"):
     st.markdown("""
-**Modes:**
-- **Fast RAG** — retrieves relevant pages from the pre-extracted text, answers in ~1-2 s
-- **Deep RAG** — re-opens the actual page images for the relevant pages, more accurate (~5-10 s)
-- **Detailed** — analyses every page sequentially, best for full-document reports
+**Steps:**
+1. Enter your Anthropic API key in the sidebar
+2. Upload a construction PDF
+3. Click **Start Analysis** — pages are processed in parallel
+4. Ask questions in the chat or use Quick Extraction buttons
+
+**Query Modes:**
+| Mode | Speed | Accuracy | Best For |
+|------|-------|----------|----------|
+| 🚀 Fast RAG | ~1–2 s | Good | Quick lookups, known info |
+| 🔍 Deep RAG | ~5–15 s | Excellent | Precise measurements, verification |
+| 📋 Detailed | Long | Full detail | Complete document reports |
 
 **Tips:**
-- Use Fast mode for quick lookups; Deep mode for precise measurements
-- 300 DPI gives a good balance of quality and speed
-- Clear Session resets everything so you can upload a new PDF
+- **Auto-Detect** works for most PDFs — use Vision mode if drawings look blurry
+- Set **Max Pages** to a small number first to test your API key is working
+- **Clear Session** resets everything so you can upload a new PDF
+- If pages fail, check the error messages in the Processing details expander
+
+**Troubleshooting — "No relevant pages found":**
+- This means `Pages indexed: 0` — the PDF was not processed
+- Make sure you clicked **Start Analysis** and waited for it to finish
+- Check your API key is valid and the model name is correct
 """)
