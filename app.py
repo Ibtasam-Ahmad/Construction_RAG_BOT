@@ -30,32 +30,66 @@ MAX_WORKERS   = 10
 BATCH_DELAY   = 0.5
 
 # ── System prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an expert Construction Plan Analyzer with deep expertise in architectural and engineering drawings. Extract ALL measurable and descriptive data.
+SYSTEM_PROMPT = """You are an expert Construction Plan Analyzer. Your task is to extract EVERY measurable and descriptive value from the provided construction drawing page, **page by page**. For each page, produce a structured output that lists each extracted value in a separate row.
 
-EXTRACTION REQUIREMENTS:
-1. Dimensions & Measurements: linear dimensions, area calculations, setbacks, clearances
-2. Materials Specifications: concrete grades, rebar sizes, steel sections, wood types, roofing, finishes
-3. Structural Elements: foundation types, column sizes, beam specs, slab thicknesses, reinforcement
-4. Architectural Elements: room names, floor areas, ceiling heights, door/window sizes, stair details
-5. Site Data: lot dimensions, site area, building footprint, zoning, easements, access points
-6. MEP Systems: mechanical, electrical, plumbing (if visible)
-7. Notes & Legends: general notes, abbreviations, scale indicators, drawing numbers, revisions
+**Mandatory extraction categories (include ALL that are visible):**
 
-OUTPUT: Structured markdown with tables. Include drawing references. Flag unclear/missing dimensions.
-If no construction data: state "No construction data found on this page."
-"""
+1. **Dimensions & Measurements** – every linear dimension (length, width, height, depth, spacing), area (room, slab, site), volume, angle, slope.
+2. **Materials** – concrete grades (e.g., 4000 psi), rebar sizes and spacing (e.g., 16mmØ @ 300mm CRS), steel sections, masonry types, roofing, finishes.
+3. **Structural Elements** – foundation depth/width, column size/spacing, beam dimensions, slab thickness, reinforcement details (bar size, spacing, count).
+4. **Architectural Elements** – room names, floor levels, ceiling heights, door/window sizes, stair tread/riser dimensions.
+5. **Site Data** – lot boundaries, setbacks, driveway dimensions, parking spaces, landscape areas, utility locations.
+6. **MEP Systems** – pipe sizes, downpipe locations, manhole references, tank dimensions (if visible).
+7. **Textual Data** – drawing number, sheet number, scale, date, revision, general notes, abbreviations.
 
-FIRST_QUERY = """Analyze this construction plan page comprehensively. Extract:
+**Output format (MUST follow):**
 
-**1. IDENTIFICATION:** Drawing number/title, sheet number, scale, date/revision
-**2. AREAS & VOLUMES:** Site/lot area, building footprint, room areas, total built area
-**3. DIMENSIONS:** Overall building (L×W×H), room dims, wall thickness, floor-ceiling heights, setbacks
-**4. MATERIALS:** Concrete grades, rebar sizes/spacing, steel sections, masonry, roofing, flooring
-**5. STRUCTURAL:** Foundation type/depth, column grid/sizes, beam sizes/spans, slab thickness, stairs
-**6. SITE FEATURES:** Driveway dims, parking, landscape areas, utility locations
-**7. TEXTUAL DATA:** General notes, abbreviations, sheet references
+For each page, start with:
 
-Present in structured markdown tables where applicable."""
+## Page <page_number> – <drawing_title> (sheet <sheet_no>)
+
+Then a table with columns:
+
+| Parameter | Value | Unit | Drawing Reference | Notes |
+|-----------|-------|------|-------------------|-------|
+
+**Rules:**
+- One row per **discrete value** (e.g., one row for “Bedroom 1 width”, another row for “Bedroom 1 length”).
+- If a value is missing or illegible, write `[missing]` in the Value column and explain in Notes.
+- Convert all imperial values to metric in parentheses (e.g., `12'-0" (3.658m)`).
+- Include the drawing reference (e.g., “A-2.03”, “Detail 3”) if visible.
+- If a page contains no construction data, output: `No construction data found on this page.`
+
+**Example row:**
+| Parameter | Value | Unit | Drawing Reference | Notes |
+|-----------|-------|------|-------------------|-------|
+| Bedroom 1 – width | 12'-0" (3.658m) | feet (m) | A-2.03 | from garage level plan |
+| Slab thickness | 150mm | mm | S-08 | typical upper roof slab |
+
+Now analyse the provided page and extract EVERY value accordingly."""
+
+FIRST_QUERY = """Analyse this construction plan page **page by page**. Extract **every single measurable and descriptive value** as per the system prompt.
+
+Follow this strict structure:
+
+## Page <number> – <title> (sheet <ref>)
+
+| Parameter | Value | Unit | Drawing Reference | Notes |
+|-----------|-------|------|-------------------|-------|
+
+**Required extractions (if present on this page):**
+- All linear dimensions (including dimensions inside detail circles)
+- All area values (room areas, slab areas, site areas)
+- All material specifications (rebar: size, spacing, grade; concrete: MPa/psi; masonry: block type)
+- All structural element sizes (beam width/depth, column width/depth, foundation thickness)
+- All architectural room labels with their measured dimensions
+- All elevation heights and level differences
+- All pipe diameters and plumbing fixture references
+- Any text note that contains a numerical value or specification
+
+**If a dimension is shown but the text is unclear, state "unclear" and describe its location (e.g., "dimension near north wall").**
+
+Proceed now."""
 
 # ── Embedding model ───────────────────────────────────────────────────────────
 @st.cache_resource
@@ -88,7 +122,7 @@ def is_scanned_pdf(pdf_bytes: bytes) -> bool:
         return True
 
 
-def pdf_page_to_b64(pdf_bytes: bytes, page_num: int, dpi: int = 200) -> str:
+def pdf_page_to_b64(pdf_bytes: bytes, page_num: int, dpi: int = 300) -> str:
     """Rasterise one PDF page to a base64-encoded JPEG string."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(page_num)
@@ -128,7 +162,7 @@ def _analyse_page_vision(pdf_bytes: bytes, page_num: int, dpi: int,
         msg = client.messages.create(
             model=model,
             system=SYSTEM_PROMPT,
-            max_tokens=4096,
+            # max_tokens=4096,
             messages=[{"role": "user", "content": [
                 {"type": "image",
                  "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
@@ -152,7 +186,7 @@ def _analyse_page_native(pdf_bytes: bytes, page_num: int,
         msg = client.messages.create(
             model=model,
             system=SYSTEM_PROMPT,
-            max_tokens=4096,
+            # max_tokens=4096,
             messages=[{"role": "user", "content": [
                 {"type": "document",
                  "source": {"type": "base64", "media_type": "application/pdf", "data": page_b64}},
@@ -265,7 +299,7 @@ def gen_rag_fast(query: str, index, metadata: List[Dict],
         return
 
     context = "\n\n".join(
-        f"--- PAGE {p['page_num']} ---\n{p['content'][:1500]}" for p in pages
+        f"--- PAGE {p['page_num']} ---\n{p['content']}" for p in pages
     )
     prompt = (
         f"Based on the following construction plan extracts, answer the question.\n"
@@ -275,7 +309,8 @@ def gen_rag_fast(query: str, index, metadata: List[Dict],
     )
     try:
         with client.messages.stream(
-            model=model, max_tokens=2048,
+            model=model, 
+            # max_tokens=2048,
             messages=[{"role": "user", "content": prompt}]
         ) as stream:
             for chunk in stream.text_stream:
@@ -313,7 +348,8 @@ def gen_rag_deep(query: str, relevant_pages: List[Dict],
     )})
     try:
         with client.messages.stream(
-            model=model, system=SYSTEM_PROMPT, max_tokens=4096,
+            model=model, system=SYSTEM_PROMPT, 
+            # max_tokens=4096,
             messages=[{"role": "user", "content": blocks}]
         ) as stream:
             for chunk in stream.text_stream:
@@ -355,7 +391,8 @@ def gen_detailed(query: str, pages_data: List[Dict], pdf_bytes: bytes,
 
             with client.messages.stream(
                 model=model, system=SYSTEM_PROMPT,
-                max_tokens=2048, messages=messages
+                # max_tokens=2048, 
+                messages=messages
             ) as stream:
                 for chunk in stream.text_stream:
                     body += chunk
@@ -423,7 +460,7 @@ with st.sidebar:
         use_deep_rag = rag_mode == "🔍 Deep (Visual Analysis)"
 
     with st.expander("Advanced Options"):
-        dpi_setting  = st.slider("Image DPI", 100, 300, 200)
+        dpi_setting  = st.slider("Image DPI", 100, 200, 300)
         max_pages    = st.number_input("Max Pages to Process", 1, 600, 100)
         context_pages = st.slider("Context Pages (RAG)", 1, 10, 3)
 
@@ -537,7 +574,7 @@ else:
                         with cols[i]:
                             try:
                                 img_b64 = pdf_page_to_b64(
-                                    st.session_state.pdf_bytes, pn, dpi=100)
+                                    st.session_state.pdf_bytes, pn, dpi=200)
                                 st.image(base64.b64decode(img_b64),
                                          caption=f"Page {pn}",
                                          use_container_width=True)
@@ -668,6 +705,6 @@ with st.expander("ℹ️ How to Use"):
 
 **Tips:**
 - Use Fast mode for quick lookups; Deep mode for precise measurements
-- 200 DPI gives a good balance of quality and speed
+- 300 DPI gives a good balance of quality and speed
 - Clear Session resets everything so you can upload a new PDF
 """)
