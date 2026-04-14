@@ -1,18 +1,12 @@
 # ============================================================
-#  Construction Plan Analyzer Pro
+#  Construction Plan Analyzer Pro - FIXED VERSION
 #  Compatible with Streamlit 1.27+
 #
 #  FIXES APPLIED:
-#    1. session_state.processed now only True when pdf_bytes + metadata exist
-#    2. use_vision persisted in session_state so it survives reruns
-#    3. max_tokens restored on every API call (prevents truncation/errors)
-#    4. Correct current Anthropic model names
-#    5. dpi_setting passed correctly into gen_rag_deep
-#    6. Guard against stale processed=True with empty metadata
-#    7. File uploader keyed to force reset on new upload
-#    8. analysis_cache never corrupts processed flag
-#    9. stream_to_placeholder handles empty generators gracefully
-#   10. All API errors surface clearly in the UI
+#    - Fixed continuous looping/scroll issue
+#    - Improved room measurement extraction
+#    - Better auto-summary handling
+#    - Enhanced query response for room dimensions
 # ============================================================
 
 import fitz  # PyMuPDF
@@ -33,20 +27,29 @@ st.set_page_config(page_title="Construction Plan Analyzer Pro", layout="wide")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 EMBEDDING_DIM = 384
-MAX_WORKERS   = 5          # reduced to avoid rate-limit bursts
-BATCH_DELAY   = 1.0        # slightly longer pause between batches
+MAX_WORKERS   = 5
+BATCH_DELAY   = 1.0
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── System prompt with ENHANCED room measurement extraction ───────────────────
 SYSTEM_PROMPT = """You are an expert Construction Plan Analyzer. Your task is to extract EVERY measurable and descriptive value from the provided construction drawing page, **page by page**. For each page, produce a structured output that lists each extracted value in a separate row.
 
 **Mandatory extraction categories (include ALL that are visible):**
 
 1. **Dimensions & Measurements** – every linear dimension (length, width, height, depth, spacing), area (room, slab, site), volume, angle, slope.
+   - **CRITICAL**: For each room, extract BOTH width AND length dimensions separately
+   - Example: "Bedroom 1 width: 3.6m, Bedroom 1 length: 4.2m"
+   
 2. **Materials** – concrete grades (e.g., 4000 psi), rebar sizes and spacing (e.g., 16mmØ @ 300mm CRS), steel sections, masonry types, roofing, finishes.
+
 3. **Structural Elements** – foundation depth/width, column size/spacing, beam dimensions, slab thickness, reinforcement details (bar size, spacing, count).
+
 4. **Architectural Elements** – room names, floor levels, ceiling heights, door/window sizes, stair tread/riser dimensions.
+   - **For EACH room**: Extract name, width, length, and area if shown
+   
 5. **Site Data** – lot boundaries, setbacks, driveway dimensions, parking spaces, landscape areas, utility locations.
+
 6. **MEP Systems** – pipe sizes, downpipe locations, manhole references, tank dimensions (if visible).
+
 7. **Textual Data** – drawing number, sheet number, scale, date, revision, general notes, abbreviations.
 
 **Output format (MUST follow):**
@@ -62,16 +65,18 @@ Then a table with columns:
 
 **Rules:**
 - One row per **discrete value** (e.g., one row for "Bedroom 1 width", another row for "Bedroom 1 length").
+- For each room, create separate rows for width and length
 - If a value is missing or illegible, write `[missing]` in the Value column and explain in Notes.
 - Convert all imperial values to metric in parentheses (e.g., `12'-0" (3.658m)`).
 - Include the drawing reference (e.g., "A-2.03", "Detail 3") if visible.
 - If a page contains no construction data, output: `No construction data found on this page.`
 
-**Example row:**
+**Example rows for a room:**
 | Parameter | Value | Unit | Drawing Reference | Notes |
 |-----------|-------|------|-------------------|-------|
 | Bedroom 1 – width | 12'-0" (3.658m) | feet (m) | A-2.03 | from garage level plan |
-| Slab thickness | 150mm | mm | S-08 | typical upper roof slab |
+| Bedroom 1 – length | 14'-6" (4.420m) | feet (m) | A-2.03 | from garage level plan |
+| Bedroom 1 – area | 174 sq ft (16.2 sq m) | sq ft (sq m) | A-2.03 | calculated from dimensions |
 
 Now analyse the provided page and extract EVERY value accordingly."""
 
@@ -85,14 +90,19 @@ Follow this strict structure:
 |-----------|-------|------|-------------------|-------|
 
 **Required extractions (if present on this page):**
+- **ALL room dimensions**: For EACH room, extract width AND length as separate rows
 - All linear dimensions (including dimensions inside detail circles)
 - All area values (room areas, slab areas, site areas)
 - All material specifications (rebar: size, spacing, grade; concrete: MPa/psi; masonry: block type)
 - All structural element sizes (beam width/depth, column width/depth, foundation thickness)
-- All architectural room labels with their measured dimensions
+- All architectural room labels with their measured dimensions (width × length)
 - All elevation heights and level differences
 - All pipe diameters and plumbing fixture references
 - Any text note that contains a numerical value or specification
+
+**CRITICAL**: When you see a room label with dimensions (e.g., "Bedroom 3600 × 4200"), create TWO separate table rows:
+Row 1: Bedroom width | 3600 | mm | ... |
+Row 2: Bedroom length | 4200 | mm | ... |
 
 **If a dimension is shown but the text is unclear, state "unclear" and describe its location (e.g., "dimension near north wall").**
 
@@ -129,27 +139,23 @@ def is_scanned_pdf(pdf_bytes: bytes) -> bool:
         return True
 
 
-MAX_IMAGE_BYTES = 4_500_000  # 4.5 MB — safely under Anthropic's 5 MB limit
+MAX_IMAGE_BYTES = 4_500_000
 
-def pdf_page_to_b64(pdf_bytes: bytes, page_num: int, dpi: int = 200) -> str:
-    """
-    Rasterise one PDF page to a base64-encoded JPEG string.
-    Automatically reduces quality / DPI until the raw bytes are < MAX_IMAGE_BYTES.
-    """
+def pdf_page_to_b64(pdf_bytes: bytes, page_num: int, dpi: int = 250) -> str:
+    """Rasterise one PDF page to a base64-encoded JPEG string."""
     doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(page_num)
 
     current_dpi = dpi
-    quality     = 85          # starting JPEG quality
+    quality     = 85
 
-    for attempt in range(6):  # up to 6 progressive downgrades
+    for attempt in range(6):
         pix = page.get_pixmap(matrix=fitz.Matrix(current_dpi / 72, current_dpi / 72))
         jpg = pix.tobytes("jpeg", jpg_quality=quality)
 
         if len(jpg) <= MAX_IMAGE_BYTES:
             break
 
-        # Downgrade strategy: first reduce quality, then reduce DPI
         if quality > 50:
             quality -= 15
         else:
@@ -239,10 +245,7 @@ def _worker(args: tuple) -> Dict:
 def process_all_pages(pdf_bytes: bytes, page_numbers: List[int],
                        use_vision: bool, dpi: int,
                        api_key: str, model: str) -> List[Dict]:
-    """
-    Parallel page processing.
-    Reads/writes st.session_state.analysis_cache ONLY in the main thread.
-    """
+    """Parallel page processing."""
     local_cache: dict = dict(st.session_state.get("analysis_cache", {}))
 
     total   = len(page_numbers)
@@ -271,7 +274,6 @@ def process_all_pages(pdf_bytes: bytes, page_numbers: List[int],
                 processed += 1
                 progress_bar.progress(processed / total)
 
-                # Write new results back to cache in the MAIN thread only
                 if res.get("cache_key") and not res.get("from_cache") and res["success"]:
                     if "analysis_cache" not in st.session_state:
                         st.session_state.analysis_cache = {}
@@ -311,7 +313,7 @@ def get_relevant_pages(query: str, index, metadata: List[Dict], k: int = 5) -> L
     return [metadata[i] for i in idxs[0] if 0 <= i < len(metadata)]
 
 
-# ── Streaming generators (no Streamlit calls inside) ─────────────────────────
+# ── Streaming generators ─────────────────────────────────────────────────────
 def gen_rag_fast(query: str, index, metadata: List[Dict],
                   client, model: str, k: int):
     if index is None or not metadata:
@@ -328,6 +330,7 @@ def gen_rag_fast(query: str, index, metadata: List[Dict],
     )
     prompt = (
         f"Based on the following construction plan extracts, answer the question.\n"
+        f"When answering about room measurements, include BOTH width and length.\n"
         f"Cite page numbers.\n\n{context}\n\n"
         f"Question: {query}\n\n"
         f"Give a concise answer with specific measurements and drawing references."
@@ -345,7 +348,7 @@ def gen_rag_fast(query: str, index, metadata: List[Dict],
 
 
 def gen_rag_deep(query: str, relevant_pages: List[Dict],
-                  pdf_bytes: bytes, client, model: str, dpi: int = 200):
+                  pdf_bytes: bytes, client, model: str, dpi: int = 250):
     if not relevant_pages:
         yield "⚠️ No relevant pages found. Try rephrasing or use Detailed mode."
         return
@@ -353,6 +356,7 @@ def gen_rag_deep(query: str, relevant_pages: List[Dict],
     blocks = [{"type": "text", "text": (
         f"User Query: {query}\n\n"
         f"Analysing {len(relevant_pages)} relevant page(s). "
+        "When providing room measurements, include BOTH width and length. "
         "Answer accurately with measurements and page references."
     )}]
     for p in relevant_pages:
@@ -368,7 +372,7 @@ def gen_rag_deep(query: str, relevant_pages: List[Dict],
             blocks.append({"type": "text", "text": f"[Image unavailable: {e}]"})
 
     blocks.append({"type": "text", "text": (
-        "\nProvide a detailed answer with specific measurements. "
+        "\nProvide a detailed answer with specific measurements (width × length for rooms). "
         "If the image contradicts the prior extract, trust the image."
     )})
     try:
@@ -431,8 +435,8 @@ def gen_detailed(query: str, pages_data: List[Dict], pdf_bytes: bytes,
             yield accumulated
 
 
-# ── Auto-summary ─────────────────────────────────────────────────────────────
-AUTO_SUMMARY_QUERY = "AUTO_INITIAL_SUMMARY"  # sentinel – never shown in UI
+# ── Auto-summary with ENHANCED room extraction ────────────────────────────────
+AUTO_SUMMARY_QUERY = "AUTO_INITIAL_SUMMARY"
 
 AUTO_SUMMARY_PROMPT = """You are analysing a full set of construction drawings.
 Using ALL the extracted page data below, produce a **structured project summary** in valid JSON.
@@ -466,6 +470,7 @@ Floor level key naming convention (use snake_case):
 
 Rules:
 - Include every room / space that has labelled dimensions.
+- For each room, include BOTH width AND length in the dimensions object
 - If a dimension is partially illegible write the legible part followed by "(?)"
 - If floor area is not stated, compute it from individual room areas where possible, else use null.
 - Do NOT include structural or MEP data in this JSON — rooms and areas only.
@@ -473,14 +478,10 @@ Rules:
 
 
 def gen_auto_summary(index, metadata: List[Dict], client, model: str) -> str:
-    """
-    Non-streaming: calls the API once with ALL indexed content and returns
-    a pretty-printed JSON string (or an error message).
-    """
+    """Non-streaming: calls the API once with ALL indexed content."""
     if not metadata:
         return '{"error": "No pages indexed."}'
 
-    # Build full context from every indexed page
     context = "\n\n".join(
         f"--- PAGE {p['page_num'] + 1} ---\n{p['content']}"
         for p in metadata
@@ -498,7 +499,6 @@ def gen_auto_summary(index, metadata: List[Dict], client, model: str) -> str:
         )
         raw = msg.content[0].text.strip()
 
-        # Strip accidental markdown fences if model added them
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -514,21 +514,16 @@ def gen_auto_summary(index, metadata: List[Dict], client, model: str) -> str:
 
 # ── Streaming display helper ──────────────────────────────────────────────────
 def stream_to_placeholder(generator, placeholder) -> str:
-    """
-    Consumes a text-chunk generator and renders it live.
-    Shows a 'Thinking…' spinner until the first token arrives.
-    Returns the full accumulated string.
-    """
+    """Consumes a text-chunk generator and renders it live."""
     full        = ""
     first_chunk = True
 
-    # Show thinking indicator before any tokens arrive
     placeholder.markdown("_💭 Thinking…_")
 
     try:
         for chunk in generator:
             if first_chunk:
-                first_chunk = False  # clear the thinking indicator on first real token
+                first_chunk = False
             full += chunk
             placeholder.markdown(full + "▌")
     except Exception as e:
@@ -553,8 +548,9 @@ defaults = dict(
     file_hash=None,
     analysis_cache={},
     pending_query=None,
-    dpi_used=200,
-    auto_summary_done=False,   # fires the structured summary once after processing
+    dpi_used=250,
+    auto_summary_done=False,
+    summary_in_progress=False,  # NEW: prevents re-triggering
 )
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -580,12 +576,15 @@ with st.sidebar:
     model = st.selectbox(
         "Claude Model",
         [
-            "claude-sonnet-4-5",
-            "claude-opus-4-5",
-            "claude-haiku-4-5",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001"
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-haiku-4-20250501",
         ],
         index=0,
-        help="claude-sonnet-4-5 offers the best balance of speed and accuracy."
+        help="claude-sonnet-4 offers the best balance of speed and accuracy."
     )
 
     st.subheader("Processing Mode")
@@ -614,7 +613,7 @@ with st.sidebar:
         use_deep_rag = rag_mode == "🔍 Deep (Visual Analysis)"
 
     with st.expander("Advanced Options"):
-        dpi_setting   = st.slider("Image DPI", 100, 300, 200,
+        dpi_setting   = st.slider("Image DPI", 100, 300, 250,
                                    help="Higher DPI = better quality but slower & more memory.")
         max_pages     = st.number_input("Max Pages to Process", 1, 600, 50)
         context_pages = st.slider("Context Pages (RAG)", 1, 10, 3)
@@ -668,11 +667,11 @@ if not st.session_state.processed:
         pdf_bytes = uploaded.read()
         file_hash = hashlib.md5(pdf_bytes).hexdigest()
 
-        # Reset cache if a different file is uploaded
         if st.session_state.file_hash != file_hash:
             st.session_state.analysis_cache  = {}
             st.session_state.chat_history    = []
             st.session_state.auto_summary_done = False
+            st.session_state.summary_in_progress = False
 
         st.session_state.pdf_bytes = pdf_bytes
         st.session_state.file_hash = file_hash
@@ -728,11 +727,9 @@ if not st.session_state.processed:
                     "❌ All pages failed to process. Check your API key and model name, "
                     "then try again."
                 )
-                # Show first error for debugging
                 if pages_data:
                     st.code(pages_data[0]["content"])
             else:
-                # Only mark processed when we actually have data
                 st.session_state.processed = True
                 st.success(
                     f"✅ Processed {successful}/{total_pages} pages in {elapsed:.1f}s"
@@ -752,17 +749,20 @@ if not st.session_state.processed:
                 st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CHAT INTERFACE  (only shown when processed=True and metadata is non-empty)
+#  CHAT INTERFACE
 # ═══════════════════════════════════════════════════════════════════════════════
 else:
     st.markdown("---")
     st.subheader("💬 Ask About Your Construction Plans")
 
-    # ── Auto-summary: fires once immediately after processing ──────────────────
-    if not st.session_state.auto_summary_done:
-        st.session_state.auto_summary_done = True   # prevent re-firing on rerun
-
-        # Add the "user" side as a styled system note (not a real user message)
+    # ── Auto-summary: FIXED to prevent looping ────────────────────────────────
+    if (not st.session_state.auto_summary_done and 
+        not st.session_state.summary_in_progress and
+        st.session_state.metadata):
+        
+        # Set flag IMMEDIATELY to prevent re-entry
+        st.session_state.summary_in_progress = True
+        
         st.session_state.chat_history.append({
             "role": "user",
             "content": "📋 **Auto-Summary** — Generate structured project summary from all pages.",
@@ -787,6 +787,10 @@ else:
             "fast_mode": True,
             "is_auto": True,
         })
+        
+        # Mark as complete
+        st.session_state.auto_summary_done = True
+        st.session_state.summary_in_progress = False
 
     # ── Render history ─────────────────────────────────────────────────────────
     for msg in st.session_state.chat_history:
@@ -802,7 +806,7 @@ else:
                             try:
                                 img_b64 = pdf_page_to_b64(
                                     st.session_state.pdf_bytes, pn,
-                                    dpi=st.session_state.get("dpi_used", 200)
+                                    dpi=st.session_state.get("dpi_used", 250)
                                 )
                                 st.image(
                                     base64.b64decode(img_b64),
@@ -848,7 +852,7 @@ else:
                             st.session_state.pdf_bytes,
                             client, model,
                             use_vision=st.session_state.use_vision,
-                            dpi=st.session_state.get("dpi_used", 200),
+                            dpi=st.session_state.get("dpi_used", 250),
                         ),
                         placeholder,
                     )
@@ -869,7 +873,7 @@ else:
                             st.session_state.pdf_bytes,
                             client,
                             model,
-                            dpi=st.session_state.get("dpi_used", 200),
+                            dpi=st.session_state.get("dpi_used", 250),
                         ),
                         placeholder,
                     )
@@ -915,6 +919,7 @@ else:
     quick_queries = {
         "📐 All Measurements": (
             "Extract ALL numerical measurements, dimensions, and areas from the entire document. "
+            "For each room, include width AND length separately. "
             "Present in tables by category: Site, Building, Rooms, Structural."
         ),
         "🧱 Materials": (
@@ -925,9 +930,9 @@ else:
             "Extract all structural info: foundation depths, column sizes, beam spans, "
             "slab thicknesses, and reinforcement details."
         ),
-        "📏 Elevations": (
-            "Summarise all elevation drawings: heights, floor levels, "
-            "and all vertical dimensions."
+        "📏 Room Dimensions": (
+            "List ALL rooms with their dimensions. For each room, show: "
+            "Room name, Width, Length, and Area. Include all floors."
         ),
     }
 
@@ -958,10 +963,9 @@ with st.expander("ℹ️ How to Use"):
 - **Auto-Detect** works for most PDFs — use Vision mode if drawings look blurry
 - Set **Max Pages** to a small number first to test your API key is working
 - **Clear Session** resets everything so you can upload a new PDF
-- If pages fail, check the error messages in the Processing details expander
+- For room measurements, the system now extracts width AND length separately
 
-**Troubleshooting — "No relevant pages found":**
-- This means `Pages indexed: 0` — the PDF was not processed
-- Make sure you clicked **Start Analysis** and waited for it to finish
-- Check your API key is valid and the model name is correct
+**New Feature - Room Dimensions:**
+- Use the "📏 Room Dimensions" quick button to get a complete list of all rooms with measurements
+- Each room will show width × length dimensions clearly
 """)
